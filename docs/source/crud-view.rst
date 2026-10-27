@@ -64,6 +64,11 @@ QuerySet and object lookup
     .. literalinclude:: ../../src/neapolitan/views.py
         :pyobject: CRUDView.get_queryset
 
+.. automethod:: CRUDView.get_ordering
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_ordering
+
 .. automethod:: CRUDView.get_object
 
     .. literalinclude:: ../../src/neapolitan/views.py
@@ -77,6 +82,21 @@ Form handling
 
     .. literalinclude:: ../../src/neapolitan/views.py
         :pyobject: CRUDView.get_form_class
+
+.. automethod:: CRUDView.get_initial
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_initial
+
+.. automethod:: CRUDView.get_prefix
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_prefix
+
+.. automethod:: CRUDView.get_form_kwargs
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_form_kwargs
 
 .. automethod:: CRUDView.get_form
 
@@ -93,6 +113,11 @@ Form handling
     .. literalinclude:: ../../src/neapolitan/views.py
         :pyobject: CRUDView.form_invalid
 
+.. automethod:: CRUDView.get_delete_form
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_delete_form
+
 .. automethod:: CRUDView.get_success_url
 
     .. literalinclude:: ../../src/neapolitan/views.py
@@ -105,6 +130,16 @@ Pagination and filtering
 
     .. literalinclude:: ../../src/neapolitan/views.py
         :pyobject: CRUDView.get_paginate_by
+
+.. automethod:: CRUDView.get_paginate_orphans
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_paginate_orphans
+
+.. automethod:: CRUDView.get_allow_empty
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_allow_empty
 
 .. automethod:: CRUDView.get_paginator
 

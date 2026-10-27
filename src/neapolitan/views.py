@@ -2,6 +2,7 @@ import enum
 
 from django.core.exceptions import ImproperlyConfigured
 from django.core.paginator import InvalidPage, Paginator
+from django import forms
 from django.forms import models as model_forms
 from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
@@ -11,6 +12,7 @@ from django.utils.decorators import classonlymethod
 from django.utils.functional import classproperty
 from django.utils.translation import gettext as _
 from django.views.generic import View
+from django.views.generic.base import ContextMixin
 from django_filters.filterset import filterset_factory
 
 
@@ -104,7 +106,18 @@ class Role(enum.Enum):
             return None
 
 
-class CRUDView(View):
+def _get_model(view):
+    """
+    Return the view's model, falling back to the model of its queryset.
+
+    Works on both the view class and instances.
+    """
+    if view.model is not None:
+        return view.model
+    return getattr(view.queryset, "model", None)
+
+
+class CRUDView(ContextMixin, View):
     """
     CRUDView is Neapolitan's core. It provides the standard list, detail,
     create, edit, and delete views for a model, as well as the hooks you need to
@@ -128,13 +141,18 @@ class CRUDView(View):
     # based on the 'model' shortcut.
     # Each of these has a corresponding `.get_<attribute>()` method.
     queryset = None
+    ordering = None
     form_class = None
+    initial = {}
+    prefix = None
+    success_url = None
     template_name = None
     context_object_name = None
 
     # Pagination parameters.
     # Set `paginate_by` to an integer value to turn pagination on.
     paginate_by = None
+    paginate_orphans = 0
     page_kwarg = "page"
     allow_empty = True
 
@@ -149,7 +167,7 @@ class CRUDView(View):
         if filterset is not None:
             queryset = filterset.qs
 
-        if not self.allow_empty and not queryset.exists():
+        if not self.get_allow_empty() and not queryset.exists():
             raise Http404
 
         paginate_by = self.get_paginate_by()
@@ -209,15 +227,22 @@ class CRUDView(View):
         """GET handler for the delete confirmation view."""
 
         self.object = self.get_object()
-        context = self.get_context_data()
+        form = self.get_delete_form()
+        context = self.get_context_data(form=form)
         return self.render_to_response(context)
 
     def process_deletion(self, request, *args, **kwargs):
         """POST handler for the delete confirmation view."""
 
         self.object = self.get_object()
+        form = self.get_delete_form(data=request.POST, files=request.FILES)
+        if not form.is_valid():
+            context = self.get_context_data(form=form)
+            return self.render_to_response(context)
+        # Resolve the URL first, while the object still has its pk.
+        success_url = self.get_success_url()
         self.object.delete()
-        return HttpResponseRedirect(self.get_success_url())
+        return HttpResponseRedirect(success_url)
 
     # Queryset and object lookup
 
@@ -229,22 +254,38 @@ class CRUDView(View):
         from which to perform the individual object lookup.
         """
         if self.queryset is not None:
-            return self.queryset._clone()
+            queryset = self.queryset.all()
+        elif self.model is not None:
+            queryset = self.model._default_manager.all()
+        else:
+            msg = (
+                "'%s' must either define 'queryset' or 'model', or override "
+                + "'get_queryset()'"
+            )
+            raise ImproperlyConfigured(msg % self.__class__.__name__)
 
-        if self.model is not None:
-            return self.model._default_manager.all()
+        ordering = self.get_ordering()
+        if ordering:
+            if isinstance(ordering, str):
+                ordering = (ordering,)
+            queryset = queryset.order_by(*ordering)
+        return queryset
 
-        msg = (
-            "'%s' must either define 'queryset' or 'model', or override "
-            + "'get_queryset()'"
-        )
-        raise ImproperlyConfigured(msg % self.__class__.__name__)
+    def get_ordering(self):
+        """
+        Returns the field or fields to order the queryset by.
+        """
+        return self.ordering
 
-    def get_object(self):
+    def get_object(self, queryset=None):
         """
         Returns the object the view is displaying.
+
+        Looks the object up in ``queryset`` if given, otherwise in
+        ``get_queryset()``.
         """
-        queryset = self.get_queryset()
+        if queryset is None:
+            queryset = self.get_queryset()
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
 
         try:
@@ -259,6 +300,15 @@ class CRUDView(View):
 
     # Form handling
 
+    def get_delete_form(self, data=None, files=None):
+        """
+        Returns the form for the delete confirmation view.
+
+        As with Django's ``DeleteView``, this is a plain ``Form`` by default.
+        Override to require extra confirmation input.
+        """
+        return forms.Form(data=data, files=files)
+
     def get_form_class(self):
         """
         Returns the form class to use in this view.
@@ -266,8 +316,9 @@ class CRUDView(View):
         if self.form_class is not None:
             return self.form_class
 
-        if self.model is not None and self.fields is not None:
-            return model_forms.modelform_factory(self.model, fields=self.fields)
+        model = _get_model(self)
+        if model is not None and self.fields is not None:
+            return model_forms.modelform_factory(model, fields=self.fields)
 
         msg = (
             "'%s' must either define 'form_class' or both 'model' and "
@@ -275,12 +326,54 @@ class CRUDView(View):
         )
         raise ImproperlyConfigured(msg % self.__class__.__name__)
 
+    def get_initial(self):
+        """
+        Returns the initial data to use for the form.
+        """
+        return self.initial.copy()
+
+    def get_prefix(self):
+        """
+        Returns the prefix to use for the form.
+        """
+        return self.prefix
+
+    def get_form_kwargs(self):
+        """
+        Returns the keyword arguments for instantiating the form.
+
+        Override this to pass extra arguments, such as the request user::
+
+            def get_form_kwargs(self):
+                kwargs = super().get_form_kwargs()
+                kwargs["user"] = self.request.user
+                return kwargs
+        """
+        kwargs = {
+            "initial": self.get_initial(),
+            "prefix": self.get_prefix(),
+            "instance": self.object,
+        }
+        if self.request.method in ("POST", "PUT"):
+            kwargs["data"] = self.request.POST
+            kwargs["files"] = self.request.FILES
+        return kwargs
+
     def get_form(self, data=None, files=None, **kwargs):
         """
         Returns a form instance.
+
+        Built from ``get_form_kwargs()``. Any ``data``, ``files``, or other
+        keyword arguments passed here take precedence.
         """
         cls = self.get_form_class()
-        return cls(data=data, files=files, **kwargs)
+        form_kwargs = self.get_form_kwargs()
+        if data is not None:
+            form_kwargs["data"] = data
+        if files is not None:
+            form_kwargs["files"] = files
+        form_kwargs.update(kwargs)
+        return cls(**form_kwargs)
 
     def form_valid(self, form):
         self.object = form.save()
@@ -291,14 +384,34 @@ class CRUDView(View):
         return self.render_to_response(context)
 
     def get_success_url(self):
-        assert self.model is not None, (
-            "'%s' must define 'model' or override 'get_success_url()'"
-            % self.__class__.__name__
+        """
+        Returns the URL to redirect to after a successful create, update, or
+        delete.
+
+        Uses ``success_url`` if set, formatted with the object's attributes
+        (e.g. ``"/bookmarks/{id}/"``). Otherwise redirects to the detail
+        view, or to the list view after a delete.
+        """
+        if self.success_url:
+            if self.object is not None:
+                return self.success_url.format(**self.object.__dict__)
+            return self.success_url
+
+        assert _get_model(self) is not None, (
+            "'%s' must define 'model' or 'queryset', or override "
+            "'get_success_url()'" % self.__class__.__name__
         )
-        if self.role == Role.DELETE:
-            success_url = Role.LIST.reverse(self)
-        else:
-            success_url = Role.DETAIL.reverse(self, self.object)
+        success_url = None
+        if self.role != Role.DELETE:
+            success_url = Role.DETAIL.maybe_reverse(self, self.object)
+        if success_url is None:
+            success_url = Role.LIST.maybe_reverse(self)
+        if success_url is None:
+            raise ImproperlyConfigured(
+                "'%s' has no detail or list URL to redirect to. Route one of "
+                "those roles, or override 'get_success_url()'."
+                % self.__class__.__name__
+            )
         return success_url
 
     # Pagination and filtering
@@ -309,17 +422,44 @@ class CRUDView(View):
         """
         return self.paginate_by
 
-    def get_paginator(self, queryset, page_size):
+    def get_paginate_orphans(self):
+        """
+        Returns the maximum number of orphans to fold into the last page.
+        """
+        return self.paginate_orphans
+
+    def get_allow_empty(self):
+        """
+        Returns whether to show the list view when there are no objects.
+
+        If ``False``, an empty list raises a 404.
+        """
+        return self.allow_empty
+
+    def get_paginator(
+        self, queryset, page_size, orphans=0, allow_empty_first_page=True, **kwargs
+    ):
         """
         Returns a paginator instance.
         """
-        return Paginator(queryset, page_size)
+        return Paginator(
+            queryset,
+            page_size,
+            orphans=orphans,
+            allow_empty_first_page=allow_empty_first_page,
+            **kwargs,
+        )
 
     def paginate_queryset(self, queryset, page_size):
         """
         Paginates a queryset, and returns a page object.
         """
-        paginator = self.get_paginator(queryset, page_size)
+        paginator = self.get_paginator(
+            queryset,
+            page_size,
+            orphans=self.get_paginate_orphans(),
+            allow_empty_first_page=self.get_allow_empty(),
+        )
         page_kwarg = self.kwargs.get(self.page_kwarg)
         page_query_param = self.request.GET.get(self.page_kwarg)
         page_number = page_kwarg or page_query_param or 1
@@ -343,7 +483,9 @@ class CRUDView(View):
         filterset_fields = getattr(self, "filterset_fields", None)
 
         if filterset_class is None and filterset_fields:
-            filterset_class = filterset_factory(self.model, fields=filterset_fields)
+            filterset_class = filterset_factory(
+                _get_model(self), fields=filterset_fields
+            )
 
         if filterset_class is None:
             return None
@@ -364,21 +506,23 @@ class CRUDView(View):
         if self.context_object_name is not None:
             return self.context_object_name
 
-        elif self.model is not None:
+        model = _get_model(self)
+        if model is not None:
             fmt = "%s_list" if is_list else "%s"
-            return fmt % self.model._meta.object_name.lower()
+            return fmt % model._meta.object_name.lower()
 
         return None
 
     def get_context_data(self, **kwargs):
-        kwargs["view"] = self
-        kwargs["object_verbose_name"] = self.model._meta.verbose_name
-        kwargs["object_verbose_name_plural"] = self.model._meta.verbose_name_plural
+        model = _get_model(self)
+        kwargs["object_verbose_name"] = model._meta.verbose_name
+        kwargs["object_verbose_name_plural"] = model._meta.verbose_name_plural
         kwargs["create_view_url"] = Role.CREATE.maybe_reverse(self)
 
         if getattr(self, "object", None) is not None:
             kwargs["object"] = self.object
             kwargs["update_view_url"] = Role.UPDATE.maybe_reverse(self, self.object)
+            kwargs["delete_view_url"] = Role.DELETE.maybe_reverse(self, self.object)
             context_object_name = self.get_context_object_name()
             if context_object_name:
                 kwargs[context_object_name] = self.object
@@ -389,7 +533,9 @@ class CRUDView(View):
             if context_object_name:
                 kwargs[context_object_name] = self.object_list
 
-        return kwargs
+        # ContextMixin adds `view` and `extra_context`, and lets other
+        # context mixins in the MRO contribute.
+        return super().get_context_data(**kwargs)
 
     def get_template_names(self):
         """
@@ -403,10 +549,11 @@ class CRUDView(View):
         if self.template_name is not None:
             return [self.template_name]
 
-        if self.model is not None and self.template_name_suffix is not None:
+        model = _get_model(self)
+        if model is not None and self.template_name_suffix is not None:
             return [
-                f"{self.model._meta.app_label}/"
-                f"{self.model._meta.object_name.lower()}"
+                f"{model._meta.app_label}/"
+                f"{model._meta.object_name.lower()}"
                 f"{self.template_name_suffix}.html",
                 f"neapolitan/object{self.template_name_suffix}.html",
             ]
@@ -458,16 +605,17 @@ class CRUDView(View):
             # Merge Role default and provided initkwargs.
             self = cls(**{**role.extra_initkwargs(), **initkwargs})
             self.role = role
+            # Attach handlers before setup(), which maps HEAD to GET.
+            for method, action in role.handlers().items():
+                handler = getattr(self, action)
+                setattr(self, method, handler)
+
             self.setup(request, *args, **kwargs)
             if not hasattr(self, "request"):
                 raise AttributeError(
                     f"{cls.__name__} instance has no 'request' attribute. Did you "
                     "override setup() and forget to call super()?"
                 )
-
-            for method, action in role.handlers().items():
-                handler = getattr(self, action)
-                setattr(self, method, handler)
 
             return self.dispatch(request, *args, **kwargs)
 
@@ -502,7 +650,7 @@ class CRUDView(View):
                 model = Bookmark
                 url_base = "something-else"
         """
-        return cls.model._meta.model_name
+        return _get_model(cls)._meta.model_name
 
     @classonlymethod
     def get_urls(cls, roles=None):

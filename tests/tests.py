@@ -378,3 +378,251 @@ class ForeignKeyDisplayTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, self.bookmark.title)
         self.assertContains(response, "python")
+
+
+class BookmarkQuerysetOnlyView(CRUDView):
+    """Configured with `queryset` but no `model`."""
+
+    queryset = Bookmark.objects.filter(favourite=False)
+    fields = ["url", "title", "note"]
+    filterset_fields = ["title"]
+
+
+class BugFixTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.homepage = Bookmark.objects.create(
+            url="https://noumenal.es/", title="Homepage", favourite=True
+        )
+        cls.github = Bookmark.objects.create(
+            url="https://github.com/carltongibson", title="GitHub"
+        )
+
+    def test_head_requests_use_get_handler(self):
+        for url in ["/bookmark/", f"/bookmark/{self.homepage.pk}/"]:
+            with self.subTest(url=url):
+                response = self.client.head(url)
+                self.assertEqual(response.status_code, 200)
+        response = self.client.options("/bookmark/")
+        self.assertIn("HEAD", response.headers["Allow"])
+
+    def test_delete_context_has_form_and_delete_view_url(self):
+        delete_url = reverse("bookmark-delete", args=[self.homepage.pk])
+        response = self.client.get(delete_url)
+        self.assertEqual(response.context["delete_view_url"], delete_url)
+        self.assertIn("form", response.context)
+        self.assertContains(response, f'action="{delete_url}"')
+
+    def test_delete_form_invalid_does_not_delete(self):
+        from django import forms
+
+        class ConfirmForm(forms.Form):
+            confirm = forms.BooleanField()
+
+        class ConfirmDeleteView(BookmarkView):
+            def get_delete_form(self, data=None, files=None):
+                return ConfirmForm(data=data, files=files)
+
+        view = ConfirmDeleteView.as_view(role=Role.DELETE)
+        rf = RequestFactory()
+        response = view(rf.post("/", {}), pk=self.homepage.pk)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(Bookmark.objects.filter(pk=self.homepage.pk).exists())
+
+        response = view(rf.post("/", {"confirm": "on"}), pk=self.homepage.pk)
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Bookmark.objects.filter(pk=self.homepage.pk).exists())
+
+    def test_queryset_only_view(self):
+        self.assertEqual(BookmarkQuerysetOnlyView.url_base, "bookmark")
+        rf = RequestFactory()
+        view = BookmarkQuerysetOnlyView.as_view(role=Role.LIST)
+        response = view(rf.get("/"))
+        response.render()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.context_data["object_list"]), [self.github])
+        self.assertIn("bookmark_list", response.context_data)
+        self.assertEqual(
+            response.template_name,
+            ["tests/bookmark_list.html", "neapolitan/object_list.html"],
+        )
+        form_class = BookmarkQuerysetOnlyView(role=Role.CREATE).get_form_class()
+        self.assertEqual(form_class._meta.model, Bookmark)
+
+    def test_queryset_may_be_a_manager(self):
+        class ManagerView(CRUDView):
+            queryset = Bookmark.objects
+
+        qs = ManagerView(role=Role.LIST).get_queryset()
+        self.assertEqual(qs.count(), 2)
+
+    def test_success_url_falls_back_to_list_view(self):
+        # BookmarkListOnlyView only routes the list role.
+        view = BookmarkListOnlyView.as_view(role=Role.CREATE)
+        request = RequestFactory().post(
+            "/", {"url": "https://example.com/", "title": "Example"}
+        )
+        response = view(request)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, "/bookmarklist/")
+
+    def test_success_url_without_routes_raises(self):
+        from django.core.exceptions import ImproperlyConfigured
+
+        class UnroutedView(BookmarkView):
+            url_base = "unrouted"
+
+        view = UnroutedView(role=Role.UPDATE)
+        view.object = self.homepage
+        with self.assertRaises(ImproperlyConfigured):
+            view.get_success_url()
+
+    def test_get_context_data_calls_super(self):
+        from django.views.generic.base import ContextMixin
+
+        class ExtraMixin(ContextMixin):
+            def get_context_data(self, **kwargs):
+                kwargs["from_mixin"] = True
+                return super().get_context_data(**kwargs)
+
+        class MixedView(BookmarkView, ExtraMixin):
+            pass
+
+        response = MixedView.as_view(role=Role.LIST)(RequestFactory().get("/"))
+        self.assertTrue(response.context_data["from_mixin"])
+        self.assertIsInstance(response.context_data["view"], MixedView)
+
+
+class HookTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.b = Bookmark.objects.create(url="https://b.example/", title="B")
+        cls.a = Bookmark.objects.create(url="https://a.example/", title="A")
+        cls.c = Bookmark.objects.create(url="https://c.example/", title="C")
+
+    def setUp(self):
+        self.rf = RequestFactory()
+
+    def test_hooks_accepted_by_as_view(self):
+        for key, value in [
+            ("ordering", ["title"]),
+            ("initial", {"title": "x"}),
+            ("prefix", "bm"),
+            ("success_url", "/done/"),
+            ("extra_context", {"x": 1}),
+            ("paginate_orphans", 1),
+        ]:
+            with self.subTest(key=key):
+                BookmarkView.as_view(role=Role.LIST, **{key: value})
+
+    def test_ordering(self):
+        for ordering in ["title", ["-title"]]:
+            with self.subTest(ordering=ordering):
+                view = BookmarkView.as_view(role=Role.LIST, ordering=ordering)
+                response = view(self.rf.get("/"))
+                titles = [b.title for b in response.context_data["object_list"]]
+                expected = ["A", "B", "C"]
+                if ordering == ["-title"]:
+                    expected.reverse()
+                self.assertEqual(titles, expected)
+
+    def test_get_object_with_queryset(self):
+        view = BookmarkView(role=Role.DETAIL)
+        view.setup(self.rf.get("/"), pk=self.a.pk)
+        self.assertEqual(view.get_object(), self.a)
+        from django.http import Http404
+
+        with self.assertRaises(Http404):
+            view.get_object(queryset=Bookmark.objects.exclude(pk=self.a.pk))
+
+    def test_initial_and_prefix(self):
+        view = BookmarkView.as_view(
+            role=Role.CREATE, initial={"title": "Prefilled"}, prefix="bm"
+        )
+        response = view(self.rf.get("/"))
+        form = response.context_data["form"]
+        self.assertEqual(form["title"].value(), "Prefilled")
+        self.assertEqual(form.prefix, "bm")
+
+        response = view(
+            self.rf.post("/", {"bm-url": "https://d.example/", "bm-title": "D"})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Bookmark.objects.filter(title="D").exists())
+
+    def test_get_initial_is_a_copy(self):
+        view = BookmarkView(role=Role.CREATE)
+        view.get_initial()["title"] = "mutated"
+        self.assertEqual(CRUDView.initial, {})
+
+    def test_get_form_kwargs(self):
+        from django import forms
+
+        class UserForm(forms.ModelForm):
+            class Meta:
+                model = Bookmark
+                fields = ["url", "title"]
+
+            def __init__(self, *args, user=None, **kwargs):
+                self.user = user
+                super().__init__(*args, **kwargs)
+
+        class UserFormView(BookmarkView):
+            form_class = UserForm
+
+            def get_form_kwargs(self):
+                kwargs = super().get_form_kwargs()
+                kwargs["user"] = "jeff"
+                return kwargs
+
+        response = UserFormView.as_view(role=Role.UPDATE)(
+            self.rf.get("/"), pk=self.a.pk
+        )
+        form = response.context_data["form"]
+        self.assertEqual(form.user, "jeff")
+        self.assertEqual(form.instance, self.a)
+
+        # Calling get_form() with no arguments picks up POST data.
+        view = UserFormView(role=Role.UPDATE)
+        view.setup(self.rf.post("/", {"url": "https://a.example/", "title": "Z"}))
+        view.object = self.a
+        form = view.get_form()
+        self.assertTrue(form.is_bound)
+        self.assertTrue(form.is_valid())
+
+    def test_success_url(self):
+        view = BookmarkView.as_view(role=Role.UPDATE, success_url="/done/{id}/")
+        response = view(
+            self.rf.post("/", {"url": "https://a.example/", "title": "A2"}),
+            pk=self.a.pk,
+        )
+        self.assertEqual(response.url, f"/done/{self.a.pk}/")
+
+        # Delete resolves the URL before the object loses its pk.
+        view = BookmarkView.as_view(role=Role.DELETE, success_url="/gone/{id}/")
+        response = view(self.rf.post("/"), pk=self.b.pk)
+        self.assertEqual(response.url, f"/gone/{self.b.pk}/")
+
+    def test_extra_context(self):
+        view = BookmarkView.as_view(role=Role.LIST, extra_context={"title": "Hi"})
+        response = view(self.rf.get("/"))
+        self.assertEqual(response.context_data["title"], "Hi")
+
+    def test_paginate_orphans(self):
+        view = BookmarkView.as_view(
+            role=Role.LIST, paginate_by=2, paginate_orphans=1, ordering="title"
+        )
+        response = view(self.rf.get("/"))
+        self.assertEqual(response.context_data["paginator"].num_pages, 1)
+        self.assertEqual(len(response.context_data["object_list"]), 3)
+
+    def test_get_allow_empty(self):
+        from django.http import Http404
+
+        class NoEmptyView(BookmarkView):
+            def get_allow_empty(self):
+                return False
+
+        Bookmark.objects.all().delete()
+        with self.assertRaises(Http404):
+            NoEmptyView.as_view(role=Role.LIST)(self.rf.get("/"))

@@ -13,6 +13,43 @@ Version numbers correspond to git tags. Please use the compare view on GitHub
 for full details. Until we're further along, I will just note the highlights
 here:
 
+Unreleased
+==========
+
+* Fixed ``HEAD`` requests returning 405 for list and detail views. Handlers are
+  now attached before ``setup()``, so Django maps ``HEAD`` to ``GET``.
+
+* The delete confirmation view now provides the documented ``form`` and
+  ``delete_view_url`` context variables. Deletion validates the form, which is
+  a plain ``Form`` by default. Override ``get_delete_form()`` to customise it.
+
+* Views configured with ``queryset`` but no ``model`` now work, using the
+  queryset's model. A ``Manager`` (e.g. ``Bookmark.objects``) is also accepted
+  as ``queryset``.
+
+* ``get_success_url()`` falls back to the list view when the detail view isn't
+  routed, and raises ``ImproperlyConfigured`` if neither is.
+
+* ``CRUDView`` now inherits from Django's ``ContextMixin``, and
+  ``get_context_data()`` calls ``super()``, so other context mixins are
+  applied. This also adds ``extra_context`` support.
+
+* Added the standard Django generic view hooks that were missing:
+
+  * ``ordering`` / ``get_ordering()``, applied in ``get_queryset()``.
+  * ``get_object(queryset=None)``, matching Django's signature.
+  * ``initial`` / ``get_initial()``, ``prefix`` / ``get_prefix()``, and
+    ``get_form_kwargs()``. ``get_form()`` now builds on ``get_form_kwargs()``;
+    any arguments passed to ``get_form()`` still take precedence.
+  * ``success_url``, formatted with the object's attributes (e.g.
+    ``"/bookmarks/{id}/"``). On delete, the URL is resolved before the object
+    is deleted.
+  * ``paginate_orphans`` / ``get_paginate_orphans()`` and ``get_allow_empty()``.
+
+  *Note*: ``get_paginator()`` now receives ``orphans`` and
+  ``allow_empty_first_page`` keyword arguments. If you override it, accept
+  them (or ``**kwargs``).
+
 26.1
 ====
 
