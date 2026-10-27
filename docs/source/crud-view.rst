@@ -93,6 +93,11 @@ Form handling
     .. literalinclude:: ../../src/neapolitan/views.py
         :pyobject: CRUDView.form_invalid
 
+.. automethod:: CRUDView.get_delete_form
+
+    .. literalinclude:: ../../src/neapolitan/views.py
+        :pyobject: CRUDView.get_delete_form
+
 .. automethod:: CRUDView.get_success_url
 
     .. literalinclude:: ../../src/neapolitan/views.py
