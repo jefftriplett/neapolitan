@@ -34,6 +34,22 @@ Unreleased
   ``get_context_data()`` calls ``super()``, so other context mixins are
   applied. This also adds ``extra_context`` support.
 
+* Added the standard Django generic view hooks that were missing:
+
+  * ``ordering`` / ``get_ordering()``, applied in ``get_queryset()``.
+  * ``get_object(queryset=None)``, matching Django's signature.
+  * ``initial`` / ``get_initial()``, ``prefix`` / ``get_prefix()``, and
+    ``get_form_kwargs()``. ``get_form()`` now builds on ``get_form_kwargs()``;
+    any arguments passed to ``get_form()`` still take precedence.
+  * ``success_url``, formatted with the object's attributes (e.g.
+    ``"/bookmarks/{id}/"``). On delete, the URL is resolved before the object
+    is deleted.
+  * ``paginate_orphans`` / ``get_paginate_orphans()`` and ``get_allow_empty()``.
+
+  *Note*: ``get_paginator()`` now receives ``orphans`` and
+  ``allow_empty_first_page`` keyword arguments. If you override it, accept
+  them (or ``**kwargs``).
+
 26.1
 ====
 

@@ -141,13 +141,18 @@ class CRUDView(ContextMixin, View):
     # based on the 'model' shortcut.
     # Each of these has a corresponding `.get_<attribute>()` method.
     queryset = None
+    ordering = None
     form_class = None
+    initial = {}
+    prefix = None
+    success_url = None
     template_name = None
     context_object_name = None
 
     # Pagination parameters.
     # Set `paginate_by` to an integer value to turn pagination on.
     paginate_by = None
+    paginate_orphans = 0
     page_kwarg = "page"
     allow_empty = True
 
@@ -162,7 +167,7 @@ class CRUDView(ContextMixin, View):
         if filterset is not None:
             queryset = filterset.qs
 
-        if not self.allow_empty and not queryset.exists():
+        if not self.get_allow_empty() and not queryset.exists():
             raise Http404
 
         paginate_by = self.get_paginate_by()
@@ -234,8 +239,10 @@ class CRUDView(ContextMixin, View):
         if not form.is_valid():
             context = self.get_context_data(form=form)
             return self.render_to_response(context)
+        # Resolve the URL first, while the object still has its pk.
+        success_url = self.get_success_url()
         self.object.delete()
-        return HttpResponseRedirect(self.get_success_url())
+        return HttpResponseRedirect(success_url)
 
     # Queryset and object lookup
 
@@ -247,22 +254,38 @@ class CRUDView(ContextMixin, View):
         from which to perform the individual object lookup.
         """
         if self.queryset is not None:
-            return self.queryset.all()
+            queryset = self.queryset.all()
+        elif self.model is not None:
+            queryset = self.model._default_manager.all()
+        else:
+            msg = (
+                "'%s' must either define 'queryset' or 'model', or override "
+                + "'get_queryset()'"
+            )
+            raise ImproperlyConfigured(msg % self.__class__.__name__)
 
-        if self.model is not None:
-            return self.model._default_manager.all()
+        ordering = self.get_ordering()
+        if ordering:
+            if isinstance(ordering, str):
+                ordering = (ordering,)
+            queryset = queryset.order_by(*ordering)
+        return queryset
 
-        msg = (
-            "'%s' must either define 'queryset' or 'model', or override "
-            + "'get_queryset()'"
-        )
-        raise ImproperlyConfigured(msg % self.__class__.__name__)
+    def get_ordering(self):
+        """
+        Returns the field or fields to order the queryset by.
+        """
+        return self.ordering
 
-    def get_object(self):
+    def get_object(self, queryset=None):
         """
         Returns the object the view is displaying.
+
+        Looks the object up in ``queryset`` if given, otherwise in
+        ``get_queryset()``.
         """
-        queryset = self.get_queryset()
+        if queryset is None:
+            queryset = self.get_queryset()
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
 
         try:
@@ -303,12 +326,54 @@ class CRUDView(ContextMixin, View):
         )
         raise ImproperlyConfigured(msg % self.__class__.__name__)
 
+    def get_initial(self):
+        """
+        Returns the initial data to use for the form.
+        """
+        return self.initial.copy()
+
+    def get_prefix(self):
+        """
+        Returns the prefix to use for the form.
+        """
+        return self.prefix
+
+    def get_form_kwargs(self):
+        """
+        Returns the keyword arguments for instantiating the form.
+
+        Override this to pass extra arguments, such as the request user::
+
+            def get_form_kwargs(self):
+                kwargs = super().get_form_kwargs()
+                kwargs["user"] = self.request.user
+                return kwargs
+        """
+        kwargs = {
+            "initial": self.get_initial(),
+            "prefix": self.get_prefix(),
+            "instance": self.object,
+        }
+        if self.request.method in ("POST", "PUT"):
+            kwargs["data"] = self.request.POST
+            kwargs["files"] = self.request.FILES
+        return kwargs
+
     def get_form(self, data=None, files=None, **kwargs):
         """
         Returns a form instance.
+
+        Built from ``get_form_kwargs()``. Any ``data``, ``files``, or other
+        keyword arguments passed here take precedence.
         """
         cls = self.get_form_class()
-        return cls(data=data, files=files, **kwargs)
+        form_kwargs = self.get_form_kwargs()
+        if data is not None:
+            form_kwargs["data"] = data
+        if files is not None:
+            form_kwargs["files"] = files
+        form_kwargs.update(kwargs)
+        return cls(**form_kwargs)
 
     def form_valid(self, form):
         self.object = form.save()
@@ -319,6 +384,19 @@ class CRUDView(ContextMixin, View):
         return self.render_to_response(context)
 
     def get_success_url(self):
+        """
+        Returns the URL to redirect to after a successful create, update, or
+        delete.
+
+        Uses ``success_url`` if set, formatted with the object's attributes
+        (e.g. ``"/bookmarks/{id}/"``). Otherwise redirects to the detail
+        view, or to the list view after a delete.
+        """
+        if self.success_url:
+            if self.object is not None:
+                return self.success_url.format(**self.object.__dict__)
+            return self.success_url
+
         assert _get_model(self) is not None, (
             "'%s' must define 'model' or 'queryset', or override "
             "'get_success_url()'" % self.__class__.__name__
@@ -344,17 +422,44 @@ class CRUDView(ContextMixin, View):
         """
         return self.paginate_by
 
-    def get_paginator(self, queryset, page_size):
+    def get_paginate_orphans(self):
+        """
+        Returns the maximum number of orphans to fold into the last page.
+        """
+        return self.paginate_orphans
+
+    def get_allow_empty(self):
+        """
+        Returns whether to show the list view when there are no objects.
+
+        If ``False``, an empty list raises a 404.
+        """
+        return self.allow_empty
+
+    def get_paginator(
+        self, queryset, page_size, orphans=0, allow_empty_first_page=True, **kwargs
+    ):
         """
         Returns a paginator instance.
         """
-        return Paginator(queryset, page_size)
+        return Paginator(
+            queryset,
+            page_size,
+            orphans=orphans,
+            allow_empty_first_page=allow_empty_first_page,
+            **kwargs,
+        )
 
     def paginate_queryset(self, queryset, page_size):
         """
         Paginates a queryset, and returns a page object.
         """
-        paginator = self.get_paginator(queryset, page_size)
+        paginator = self.get_paginator(
+            queryset,
+            page_size,
+            orphans=self.get_paginate_orphans(),
+            allow_empty_first_page=self.get_allow_empty(),
+        )
         page_kwarg = self.kwargs.get(self.page_kwarg)
         page_query_param = self.request.GET.get(self.page_kwarg)
         page_number = page_kwarg or page_query_param or 1
